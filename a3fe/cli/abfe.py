@@ -546,19 +546,41 @@ def cmd_reset(args):
 # --------------------------------------------------------------------------- #
 
 
-def age(timestamp):
+def parse_time(timestamp):
     try:
-        delta = datetime.datetime.now() - datetime.datetime.strptime(
-            timestamp, "%Y-%m-%d %H:%M:%S"
-        )
+        return datetime.datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
     except (TypeError, ValueError):
+        return None
+
+
+def duration(start, end=None):
+    """The time between two timestamps (until now by default), e.g. '2h05m'."""
+    start, end = parse_time(start), parse_time(end) if end else datetime.datetime.now()
+    if start is None or end is None:
         return "-"
-    minutes = int(delta.total_seconds() // 60)
+    minutes = max(int((end - start).total_seconds() // 60), 0)
     if minutes < 60:
         return f"{minutes}m"
     if minutes < 48 * 60:
         return f"{minutes // 60}h{minutes % 60:02d}m"
     return f"{minutes // 1440}d"
+
+
+def age(timestamp):
+    return duration(timestamp)
+
+
+def elapsed(state, effective):
+    """The wall time of a ligand: from the first start of its driver until it
+    finished (or until now if it is running, or until it stopped otherwise).
+    This includes the time its jobs waited in the queue."""
+    start = state.get("first_started") or state.get("started")
+    if effective in (NEW, QUEUED) and not state.get("first_started"):
+        return "-"
+    if effective == RUNNING:
+        return duration(start)
+    end = state.get("finished") if effective == DONE else state.get("updated")
+    return duration(start, end) if end else "-"
 
 
 def cmd_status(args):
@@ -597,6 +619,7 @@ def cmd_status(args):
                 sims,
                 f"{jobs['R']}/{jobs['Q']}",
                 dg,
+                elapsed(state, eff),
                 age(state.get("updated")),
                 note,
             )
@@ -609,6 +632,7 @@ def cmd_status(args):
         "SIMS",
         "JOBS R/Q",
         "dG (kcal/mol)",
+        "ELAPSED",
         "UPDATED",
         "",
     )
@@ -641,6 +665,7 @@ def status_detail(batch_dir, lig, active_jobs):
     ):
         if state.get(key) is not None:
             print(f"    {key:10s} {state[key]}")
+    print(f"    {'elapsed':10s} {elapsed(state, eff)}")
     result = read_result(batch_dir, lig)
     if result:
         print(
@@ -1082,8 +1107,10 @@ def cmd_run(args):
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
+    # first_started is kept when a ligand is resumed, to report its total wall time
+    first_started = read_state(batch_dir, lig).get("first_started") or now()
     update(state=RUNNING, stage="prepare", job_id=job_id or None, host=os.uname().nodename,
-           started=now(), error=None)  # fmt: skip
+           started=now(), first_started=first_started, finished=None, error=None)  # fmt: skip
     print(
         f"\n[{now()}] ===== {lig}: driver started (job {job_id or 'none'}) =====",
         flush=True,

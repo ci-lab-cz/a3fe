@@ -174,7 +174,9 @@ States
      - stopped with ``a3fe-abfe cancel``
 
 In the status table ``SIMS`` is the number of finished / all production simulations, and ``JOBS R/Q`` the number of
-running / waiting simulation jobs of the ligand.
+running / waiting simulation jobs of the ligand. ``ELAPSED`` is the wall time of the ligand, from the first start of its
+driver job until it finished (or until now, if it is running), including the time its jobs waited in the queue.
+``UPDATED`` is the time since the last change of its state.
 
 Resuming
 ~~~~~~~~

@@ -1,5 +1,6 @@
 """Unit tests for the a3fe-abfe command line tool. No scheduler is required."""
 
+import datetime
 import json
 import os
 import stat
@@ -375,7 +376,16 @@ def test_status_and_collect(batch, capsys):
             "Free energy from run 1: -4.0 +/- 0.1 kcal/mol\n"
             "Free energy from run 2: -5.0 +/- 0.1 kcal/mol\n"
         )
-    set_state(batch, "lig_B_2", state=abfe.DONE, sims_done=4, sims_total=4)
+    set_state(
+        batch,
+        "lig_B_2",
+        state=abfe.DONE,
+        sims_done=4,
+        sims_total=4,
+        first_started="2026-01-01 10:00:00",
+        started="2026-01-01 11:00:00",
+        finished="2026-01-01 12:05:30",
+    )
     set_state(batch, "lig_lig_A", state=abfe.RUNNING, job_id="11", stage="production")
     jobs = {"11": ("drv.lig_lig_A", "R"), "12": ("sim.lig_lig_A", "Q")}
     with patch.object(abfe.Scheduler, "active_jobs", return_value=jobs):
@@ -383,7 +393,7 @@ def test_status_and_collect(batch, capsys):
     lines = capsys.readouterr().out.splitlines()
     assert any(
         line.split()
-        == ["lig_B_2", "done", "-", "4/4", "0/0", "-4.5", "+/-", "1.2", "0m"]
+        == ["lig_B_2", "done", "-", "4/4", "0/0", "-4.5", "+/-", "1.2", "2h05m", "0m"]
         for line in lines
     )
     assert any(
@@ -406,3 +416,25 @@ def test_state_file(batch):
         state = json.load(f)
     assert (state["state"], state["stage"]) == (abfe.RUNNING, "production")
     assert "updated" in state
+
+
+def test_elapsed():
+    """Test the wall time reported for a ligand."""
+    start = (datetime.datetime.now() - datetime.timedelta(minutes=90)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    assert abfe.elapsed({}, abfe.NEW) == "-"
+    assert abfe.elapsed({"first_started": start}, abfe.RUNNING) == "1h30m"
+    # Without first_started (older state files) the last start is used
+    assert abfe.elapsed({"started": start}, abfe.RUNNING) == "1h30m"
+    stopped = {
+        "first_started": "2026-01-01 10:00:00",
+        "updated": "2026-01-01 10:20:00",
+        "finished": None,
+    }
+    assert abfe.elapsed(stopped, abfe.FAILED) == "20m"
+    assert abfe.elapsed(stopped, abfe.INTERRUPTED) == "20m"
+    # A resumed ligand which waits in the queue again keeps its time so far
+    assert abfe.elapsed(stopped, abfe.QUEUED) == "20m"
+    done = dict(stopped, finished="2026-01-03 10:00:00")
+    assert abfe.elapsed(done, abfe.DONE) == "2d"
