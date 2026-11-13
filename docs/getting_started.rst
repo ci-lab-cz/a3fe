@@ -1,6 +1,6 @@
 Getting Started
 ===============
-a3fe is a package for running alchemical absolute binding free energy calculations with SOMD (Sire / OpenMM Molecular Dynamics) through SLURM.
+a3fe is a package for running alchemical absolute binding free energy calculations with SOMD (Sire / OpenMM Molecular Dynamics) through SLURM or PBS.
 GROMACS can also be used as the production engine for non-adaptive calculations.
 It is based on Sire(https://sire.openbiosim.org/) and also uses BioSimSpace(https://biosimspace.openbiosim.org/) during the set-up stages. For a
 discussion of the algorithms used, please see (https://pubs.acs.org/doi/10.1021/acs.jctc.4c00806).
@@ -45,7 +45,7 @@ Quick Tips
 
 Some handy commands and code snippets, assuming that you have set up the calculation following the code above:
 
-**Terminate all the SLURM jobs**: ``calc.kill()``
+**Terminate all the SLURM / PBS jobs**: ``calc.kill()``
 
 **Delete all the output** (but not input files), ready to run again: ``calc.clean()``
 

@@ -64,12 +64,16 @@ the :class:`a3fe.SlurmConfig` of your calculation (or other simulation runner). 
 
 If you don't supply a partition to the SlurmConfig, a3fe will use the default partition.
 
+PBS (PBS Professional / OpenPBS) clusters are also supported: supply a :class:`a3fe.PbsConfig` instead of a
+:class:`a3fe.SlurmConfig` (see :ref:`PBS Options`). If you don't supply any configuration, a3fe detects whether SLURM or PBS
+is available and uses the default partition / queue.
+
 If the input is not parameterised, a3fe will parameterise your input with ff14SB, OFF 2.0.0, and TIP3P by default. See
 :ref:`preparing input<preparing-input>`. By default, a3fe will solvate your system in a rhombic dodecahedral box with 150 mM NaCl
 and perform a standard minimisation, heating, and pre-equilibration routine.
 
 At present, a3fe uses GROMACS to run all set-up jobs, so please ensure that you have loaded the required CUDA and
-GROMACS modules, or sourced GMXRC. These GROMACS jobs are also submitted through SLURM, and a unique 5 ns "ensemble
+GROMACS modules, or sourced GMXRC. These GROMACS jobs are also submitted through SLURM / PBS, and a unique 5 ns "ensemble
 equilibration" simulation is run for each of the ``ensemble_size`` repeats. For the bound leg, these are used to extract
 different Boresch restraints for each replicate simulation using the in-built BioSimSpace algorithm (see
 `the BioSimSpace restraint selection code <https://github.com/fjclark/BioSimSpace/blob/01dba53b01386a3851e277874f9080c316c4632e/python/BioSimSpace/Sandpit/Exscientia/FreeEnergy/_restraint_search.py#L902>`_).

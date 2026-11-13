@@ -27,6 +27,7 @@ from ..analyse.exceptions import AnalysisError as _AnalysisError
 from ..analyse.plot import plot_convergence as _plot_convergence
 from ..analyse.plot import plot_sq_sem_convergence as _plot_sq_sem_convergence
 from ..configuration import EngineType as _EngineType
+from ..configuration import PbsConfig as _PbsConfig
 from ..configuration import SlurmConfig as _SlurmConfig
 from ..configuration import _EngineConfig
 from ..engines import EngineBackend as _EngineBackend
@@ -170,6 +171,14 @@ class SimulationRunner(ABC):
             # Set up logging
             self._stream_log_level = stream_log_level
             self._set_up_logging()
+
+            # If no config is provided and only PBS is available, create a PBS
+            # config with the default queue
+            if slurm_config is None and _PbsConfig.is_available():
+                slurm_config = _PbsConfig.get_default_config()
+                self._logger.info(
+                    f"No scheduler config provided, using default {slurm_config!r}"
+                )
 
             # Create a SLURM config with the default partition if none is provided
             if slurm_config is None:

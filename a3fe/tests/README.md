@@ -1,6 +1,6 @@
 # A3FE Integration Tests
 
-This directory contains integration tests for A3FE, which are designed to run in a local SLURM environment rather than in a CI environment, as they may require longer run times and SLURM resources.
+This directory contains integration tests for A3FE, which are designed to run in a local SLURM (or PBS) environment rather than in a CI environment, as they may require longer run times and SLURM resources.
 
 ## Prerequisites
 
@@ -57,6 +57,6 @@ The integration tests will:
 These tests use example data from a3fe/data/t4l_input as input.
 
 ## Notes
-1. These tests require an available SLURM environment
+1. These tests require an available SLURM or PBS environment (the default configuration for the detected scheduler is used)
 2. Tests will create temporary directories to store output files
 3. Directories and SLURM jobs will be automatically cleaned up after tests complete

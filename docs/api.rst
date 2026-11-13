@@ -6,6 +6,7 @@ API Documentation
 
    a3fe.configuration
    a3fe.configuration.slurm_config
+   a3fe.configuration.pbs_config
    a3fe.configuration.engine_config
    a3fe.configuration.system_prep_config
    a3fe.configuration.enums

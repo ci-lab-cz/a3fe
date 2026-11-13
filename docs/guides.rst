@@ -207,6 +207,43 @@ also set other options:
         analysis_slurm_config = a3.SlurmConfig(partition="my-cluster-cpu-partition", time="00:10:00")
         calc = a3.Calculation(slurm_config=slurm_config, analysis_slurm_config=analysis_slurm_config)
 
+PBS Options
+-----------
+
+a3fe can also submit jobs through PBS (PBS Professional / OpenPBS). To do this, supply a :class:`a3fe.PbsConfig` wherever a
+:class:`a3fe.SlurmConfig` is accepted. The argument and attribute names (``slurm_config``, ``analysis_slurm_config``, ``slurm=True`` etc.)
+are the same for both schedulers:
+
+.. code-block:: python
+
+    pbs_config = a3.PbsConfig(queue="my-cluster-gpu-queue", walltime="12:00:00", ncpus=1, ngpus=1)
+    analysis_pbs_config = a3.PbsConfig(queue="my-cluster-cpu-queue", walltime="00:10:00", ngpus=0)
+    calc = a3.Calculation(slurm_config=pbs_config, analysis_slurm_config=analysis_pbs_config)
+
+If no configuration is supplied, a3fe uses SLURM if ``sbatch`` is available and PBS if only ``qsub`` is available, with the default partition / queue.
+On PBS, a GPU is then requested only if the cluster has any.
+
+The resources are requested with ``#PBS -l select=1:ncpus=<ncpus>:ngpus=<ngpus>:mem=<mem>`` (``ngpus`` and ``mem`` are omitted if they are 0 / None).
+For anything more specific to your cluster, supply the full statement with ``select``, and pass other qsub options through ``extra_options``:
+
+.. code-block:: python
+
+    pbs_config = a3.PbsConfig(
+        select="1:ncpus=8:ngpus=1:scratch_local=10gb",
+        extra_options={"A": "my_account", "l": "place=excl"},  # Written as "#PBS -A my_account" etc.
+    )
+
+To run on CPU-only nodes (e.g. with the GROMACS engine), set ``ngpus=0`` and request the cores you need with ``ncpus``.
+With ``walltime=None`` no time limit is requested, so that the default of the queue applies.
+
+.. note::
+
+    Unlike SLURM, PBS starts each job in a new login shell, so the environment of the submitting process is not reliably available to the job
+    (even though it is exported with ``qsub -V`` by default). Use ``setup_commands`` to list the commands which set up the environment in the job
+    script, e.g. ``setup_commands=["module load gromacs", "source ~/miniconda3/etc/profile.d/conda.sh", "conda activate a3fe"]``.
+    By default, ``setup_commands`` activates the conda environment which is active when the ``PbsConfig`` is created, so you only need to set this
+    if you require more than the conda environment (e.g. modules).
+
 Running Fast Non-Adaptive Calculations
 ***************************************
 

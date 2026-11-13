@@ -4,6 +4,7 @@ import getpass as _getpass
 import glob as _glob
 import logging as _logging
 import os as _os
+import shutil as _shutil
 import subprocess as _subprocess
 from dataclasses import dataclass as _dataclass
 from time import sleep as _sleep
@@ -11,6 +12,7 @@ from typing import List as _List
 from typing import Optional as _Optional
 
 from ..configuration.enums import JobStatus as _JobStatus
+from ..configuration.pbs_config import PbsConfig as _PbsConfig
 from ._logging_formatters import _A3feFileFormatter, _A3feStreamFormatter
 from ._utils import retry as _retry
 
@@ -177,7 +179,10 @@ class VirtualQueue:
         # If the job is in the real queue, kill it
         if job in self._slurm_queue:
             self._slurm_queue.remove(job)
-            _subprocess.run(["scancel", str(job.slurm_job_id)])
+            if _PbsConfig.is_submission_cmd(job.command_list):
+                _subprocess.run(_PbsConfig.get_kill_cmd(job.slurm_job_id))
+            else:
+                _subprocess.run(["scancel", str(job.slurm_job_id)])
         else:  # Job is in the pre-queue
             self._pre_queue.remove(job)
         job.status = _JobStatus.KILLED  # type: ignore
@@ -228,6 +233,22 @@ class VirtualQueue:
             ]
             return running_slurm_job_ids
 
+        # Jobs submitted to PBS (with a PbsConfig) are tracked in the PBS queue
+        @_retry(times=5, exceptions=(ValueError), wait_time=120, logger=self._logger)
+        def _read_pbs_queue_inner() -> _List[int]:
+            return _PbsConfig.read_queue(_getpass.getuser())
+
+        if any(_PbsConfig.is_submission_cmd(job.command_list) for job in self.queue):
+            running_job_ids = _read_pbs_queue_inner()
+            # Only read the SLURM queue as well if SLURM is present
+            if _shutil.which("squeue") is not None:
+                running_job_ids += _read_slurm_queue_inner()
+            return running_job_ids
+
+        # Do not attempt to read the SLURM queue on a PBS-only cluster
+        if _PbsConfig.is_available():
+            return []
+
         return _read_slurm_queue_inner()
 
     def _submit_job(self, job_command_list: _List[str]) -> int:
@@ -268,6 +289,8 @@ class VirtualQueue:
             process_output = process.stdout.read()
             process_output = process_output.decode("utf-8").strip()
             try:
+                if _PbsConfig.is_submission_cmd(job_command_list):
+                    return _PbsConfig.parse_job_id(process_output)
                 slurm_job_id = int((process_output.split()[-1]))
                 return slurm_job_id
             except Exception as e:

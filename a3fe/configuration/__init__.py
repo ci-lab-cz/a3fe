@@ -8,6 +8,7 @@ from .enums import (
     PreparationStage,
     StageType,
 )
+from .pbs_config import PbsConfig
 from .slurm_config import SlurmConfig
 from .system_prep_config import (
     GromacsSystemPreparationConfig,

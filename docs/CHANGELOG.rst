@@ -5,6 +5,8 @@ Change Log
 Unreleased
 ====================
 
+- Added support for the PBS (PBS Professional / OpenPBS) scheduler through ``a3fe.PbsConfig``, which can be supplied wherever a ``SlurmConfig`` is accepted. The available scheduler is detected if no configuration is supplied.
+
 0.5.0
 ====================
 

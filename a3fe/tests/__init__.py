@@ -10,6 +10,13 @@ import a3fe
 # Check if slurm is present
 SLURM_PRESENT = False if shutil.which("sbatch") is None else True
 
+# Check if pbs is present
+PBS_PRESENT = False if shutil.which("qsub") is None else True
+
+# Check if any supported scheduler is present. The integration tests use the
+# default configuration for the available scheduler.
+SCHEDULER_PRESENT = SLURM_PRESENT or PBS_PRESENT
+
 # Check if gromacs is present
 GROMACS_PRESENT = False if shutil.which("gmx") is None else True
 

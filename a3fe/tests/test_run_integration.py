@@ -28,7 +28,7 @@ from tempfile import TemporaryDirectory
 import pytest
 
 import a3fe as a3
-from a3fe.tests import GROMACS_PRESENT, RUN_SLURM_TESTS, SLURM_PRESENT
+from a3fe.tests import GROMACS_PRESENT, RUN_SLURM_TESTS, SCHEDULER_PRESENT
 
 # Define the legs and stages for testing
 LEGS_WITH_STAGES = {
@@ -99,7 +99,7 @@ def gromacs_slurm_discharge_stage():
 
 
 @pytest.mark.integration
-@pytest.mark.skipif(not SLURM_PRESENT, reason="SLURM not present")
+@pytest.mark.skipif(not SCHEDULER_PRESENT, reason="SLURM / PBS not present")
 @pytest.mark.skipif(not RUN_SLURM_TESTS, reason="RUN_SLURM_TESTS is False")
 class TestSlurmIntegration:
     """Test class for SLURM integration tests."""
@@ -289,7 +289,7 @@ class TestSlurmIntegration:
 
 
 @pytest.mark.integration
-@pytest.mark.skipif(not SLURM_PRESENT, reason="SLURM not present")
+@pytest.mark.skipif(not SCHEDULER_PRESENT, reason="SLURM / PBS not present")
 @pytest.mark.skipif(not GROMACS_PRESENT, reason="GROMACS not present")
 @pytest.mark.skipif(not RUN_SLURM_TESTS, reason="RUN_SLURM_TESTS is False")
 class TestGromacsSlurmIntegration:
