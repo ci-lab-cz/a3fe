@@ -37,6 +37,10 @@ dependencies = [
      "pyyaml",
 ]
 
+# Command line tools
+[project.scripts]
+a3fe-abfe = "a3fe.cli.abfe:main"
+
 # Update the urls once the hosting is set up.
 [project.urls]
 "Source" = "https://github.com/michellab/a3fe/"
@@ -84,7 +88,8 @@ where = ["."]
 # Ref https://setuptools.pypa.io/en/latest/userguide/datafiles.html#package-data
 [tool.setuptools.package-data]
 a3fe = [
-    "py.typed"
+    "py.typed",
+    "cli/abfe_template.yaml",
 ]
 
 [tool.versioningit]

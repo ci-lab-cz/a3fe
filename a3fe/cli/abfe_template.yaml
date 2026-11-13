@@ -1,0 +1,75 @@
+# Settings of a batch of a3fe ABFE calculations (read by a3fe-abfe).
+# Keep this file in the batch directory, next to the lig_* directories.
+
+scheduler: pbs              # pbs | slurm
+engine: gromacs             # gromacs (CPU or GPU nodes) | somd (GPU nodes only)
+
+# Number of ligands processed at the same time. The next ligands are started
+# automatically as running ones finish.
+max_active_ligands: 10
+
+# A ligand whose driver job died (e.g. walltime, node failure) is resumed
+# automatically by "a3fe-abfe submit", but at most this many times in total.
+max_attempts: 3
+
+# Seconds to wait between the submissions of the production jobs of a ligand.
+# Hundreds of jobs submitted and started at the same moment can overload the
+# scheduler and the nodes.
+submit_delay: 1.0
+
+# Commands run at the start of every job, before the conda environment which
+# was active when "a3fe-abfe submit" was called is activated. For example:
+# setup_commands:
+#   - module load GROMACS/2024.4-foss-2023b-CUDA-12.4.0
+setup_commands: []
+
+# Resources of the driver job (one per ligand). It prepares the input, submits
+# and tracks the simulation jobs and runs the analysis, and has to live as long
+# as the whole calculation of a ligand takes.
+driver:
+  queue: null               # PBS queue / SLURM partition (null = default)
+  walltime: null            # null = no time limit requested (the default of the queue applies)
+  ncpus: 2
+  mem: 16gb
+  extra_options: {}         # scheduler options, e.g. {A: my_account} (PBS) or {account: OPEN-XX-XX} (SLURM)
+
+# Resources of each simulation job (set-up simulations and production windows)
+simulation:
+  queue: null
+  walltime: "08:00:00"      # null = no time limit requested
+  ncpus: 8
+  ngpus: 0                  # 0 = CPU only; 1 for GPU nodes (required for somd)
+  mem: 8gb                  # always request memory: without it PBS may give a job very little
+  extra_options: {}
+
+protocol:
+  ensemble_size: 5          # independent replicates of each lambda window
+  runtime: 0.1              # ns of production per window
+  equilibration_time: 0.02  # ns discarded at the start of each window in the analysis
+  max_sim_retries: 2        # how often failed windows are repeated
+  lighten: false            # true: delete trajectories and restart files after the analysis
+
+  # Changes to the a3fe system preparation settings (times in ps).
+  # These are the shortened ("fast") settings of the original template.
+  sysprep:
+    runtime_npt: 50
+    runtime_npt_unrestrained: 50
+    ensemble_equilibration_time: 1000
+
+  # Options of the engine: fields of a3fe.GromacsConfig or a3fe.SomdConfig.
+  # The original (SOMD) template used: {cutoff_type: PME, cutoff_distance: 10.0}
+  engine_options: {}
+
+  # Lambda schedule. null = defaults of a3fe for the engine.
+  # lambda_values: null
+  # Example (the schedule of the original SOMD template):
+  lambda_values:
+    bound:
+      restrain: [0.0, 1.0]
+      discharge: [0.0, 0.291, 0.54, 0.776, 1.0]
+      vanish: [0.0, 0.026, 0.054, 0.083, 0.111, 0.14, 0.173, 0.208, 0.247, 0.286,
+               0.329, 0.373, 0.417, 0.467, 0.514, 0.564, 0.623, 0.696, 0.833, 1.0]
+    free:
+      discharge: [0.0, 0.222, 0.447, 0.713, 1.0]
+      vanish: [0.0, 0.026, 0.055, 0.09, 0.126, 0.164, 0.202, 0.239, 0.276, 0.314,
+               0.354, 0.396, 0.437, 0.478, 0.518, 0.559, 0.606, 0.668, 0.762, 1.0]

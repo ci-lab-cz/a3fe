@@ -83,6 +83,8 @@ calc = a3.Calculation(
 
 GROMACS calculations currently support non-adaptive runs only, as shown above.
 
+To run calculations for many ligands on a cluster, see the `a3fe-abfe` command line tool, which prepares, runs, tracks and resumes them ("Batch workflow" in the documentation).
+
 - Check the results in the ``output`` directories (separate output directories are created for the Calculation, Legs, and Stages)
 
 ### Copyright
