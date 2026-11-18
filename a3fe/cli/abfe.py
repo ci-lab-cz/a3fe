@@ -15,6 +15,8 @@ ligand. Nothing has to stay running on the login node.
     a3fe-abfe status              overview of all ligands
     a3fe-abfe status lig_X        details of one ligand
     a3fe-abfe cancel lig_X        stop a ligand (or --all)
+    a3fe-abfe hold                pause the batch to free the nodes
+    a3fe-abfe release             continue a paused batch
     a3fe-abfe collect             table of the results
 
 See the "Batch workflow" page of the documentation for details.
@@ -25,6 +27,7 @@ import datetime
 import fcntl
 import getpass
 import glob
+import hashlib
 import json
 import os
 import re
@@ -47,6 +50,9 @@ CONFIG_TEMPLATE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "abfe_template.yaml"
 )
 STATE_DIR = ".abfe"
+# Present in the batch directory while the batch is paused with 'hold'
+HOLD_NAME = ".abfe.hold"
+HOLD_CHECK_INTERVAL = 60  # s
 LIG_PREFIX = "lig_"
 
 DEFAULTS = {
@@ -234,12 +240,58 @@ def read_result(batch_dir, lig):
 # --------------------------------------------------------------------------- #
 
 
-def driver_job_name(lig):
-    return f"drv.{lig}"
+def batch_tag(batch_dir):
+    """A short identifier of the batch directory. It is part of the job names,
+    so that the jobs of ligands with the same name in different batches are
+    not mixed up."""
+    return hashlib.sha1(os.path.realpath(batch_dir).encode()).hexdigest()[:6]
 
 
-def sim_job_name(lig):
-    return f"sim.{lig}"
+def driver_job_name(batch_dir, lig):
+    return f"drv.{lig}.{batch_tag(batch_dir)}"
+
+
+def sim_job_name(batch_dir, lig):
+    return f"sim.{lig}.{batch_tag(batch_dir)}"
+
+
+def batch_jobs(batch_dir, active_jobs):
+    """Return the ids of the waiting simulation jobs, the waiting driver jobs
+    and the running simulation jobs of the batch."""
+    ligands = list_ligands(batch_dir)
+    sim_names = {sim_job_name(batch_dir, lig) for lig in ligands}
+    drv_names = {driver_job_name(batch_dir, lig) for lig in ligands}
+    waiting_sims = [j for j, (n, s) in active_jobs.items() if n in sim_names and s != "R"]  # fmt: skip
+    waiting_drvs = [j for j, (n, s) in active_jobs.items() if n in drv_names and s != "R"]  # fmt: skip
+    running_sims = [j for j, (n, s) in active_jobs.items() if n in sim_names and s == "R"]  # fmt: skip
+    return waiting_sims, waiting_drvs, running_sims
+
+
+def hold_path(batch_dir):
+    return os.path.join(batch_dir, HOLD_NAME)
+
+
+def is_held(batch_dir):
+    return os.path.isfile(hold_path(batch_dir))
+
+
+def read_hold(batch_dir):
+    try:
+        with open(hold_path(batch_dir)) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def wait_while_held(batch_dir):
+    """Block while the batch is paused. Returns True if it had to wait."""
+    if not is_held(batch_dir):
+        return False
+    print(f"[{now()}] The batch is on hold - waiting for 'release'", flush=True)
+    while is_held(batch_dir):
+        time.sleep(HOLD_CHECK_INTERVAL)
+    print(f"[{now()}] The batch was released - continuing", flush=True)
+    return True
 
 
 def conda_setup_commands():
@@ -302,10 +354,26 @@ class Scheduler:
         raise RuntimeError(f"{' '.join(cmd)} failed: {result.stderr.strip()}")
 
     def cancel(self, job_ids):
+        self._apply(["qdel"] if self.kind == "pbs" else ["scancel"], job_ids)
+
+    def hold(self, job_ids):
+        """Keep waiting jobs from starting."""
+        self._apply(["qhold"] if self.kind == "pbs" else ["scontrol", "hold"], job_ids)
+
+    def release(self, job_ids):
+        """Let held jobs start again (harmless for jobs which are not held)."""
+        self._apply(
+            ["qrls"] if self.kind == "pbs" else ["scontrol", "release"], job_ids
+        )
+
+    @staticmethod
+    def _apply(cmd, job_ids):
         job_ids = [str(j) for j in job_ids]
         for i in range(0, len(job_ids), 200):
-            cmd = ["qdel"] if self.kind == "pbs" else ["scancel"]
-            subprocess.run(cmd + job_ids[i : i + 200], capture_output=True)
+            chunk = job_ids[i : i + 200]
+            # scontrol takes a comma separated list of job ids
+            chunk = [",".join(chunk)] if cmd[0] == "scontrol" else chunk
+            subprocess.run(cmd + chunk, capture_output=True)
 
     def submit_driver(self, batch_dir, lig):
         """Write and submit the driver job of a ligand. Returns the job id."""
@@ -318,7 +386,7 @@ class Scheduler:
             select = f"1:ncpus={res['ncpus']}" + (
                 f":mem={res['mem']}" if res["mem"] else ""
             )
-            lines += [f"#PBS -N {driver_job_name(lig)}"]
+            lines += [f"#PBS -N {driver_job_name(batch_dir, lig)}"]
             lines += [f"#PBS -q {res['queue']}"] if res["queue"] else []
             lines += [
                 f"#PBS -l select={select}",
@@ -331,7 +399,7 @@ class Scheduler:
             lines += [f"#PBS -{k} {v}" for k, v in res["extra_options"].items()]
             lines += [f"exec >> {shlex.quote(log)} 2>&1"]
         else:
-            lines += [f"#SBATCH --job-name={driver_job_name(lig)}"]
+            lines += [f"#SBATCH --job-name={driver_job_name(batch_dir, lig)}"]
             lines += [f"#SBATCH --partition={res['queue']}"] if res["queue"] else []
             lines += [f"#SBATCH --time={res['walltime']}"] if res["walltime"] else []
             lines += [
@@ -435,38 +503,14 @@ def cmd_submit(args):
     explicit = bool(args.ligands)
     ligands = select_ligands(batch_dir, args.ligands)
     max_active = args.max_active or cfg["max_active_ligands"]
-    with BatchLock(batch_dir):
-        active_jobs = sched.active_jobs()
-        states = {lig: read_state(batch_dir, lig) for lig in list_ligands(batch_dir)}
-        eff = {lig: effective_state(s, active_jobs) for lig, s in states.items()}
-        n_active = sum(e in (QUEUED, RUNNING) for e in eff.values())
-        submitted, skipped = [], []
-        for lig in ligands:
-            state, e = states[lig], eff[lig]
-            retry = explicit or args.retry
-            if e in (DONE, QUEUED, RUNNING):
-                continue
-            if e in (FAILED, CANCELLED) and not retry:
-                continue
-            if e == INTERRUPTED and not retry:
-                # Do not resume a ligand whose driver keeps dying forever
-                if state.get("attempts", 0) >= cfg["max_attempts"]:
-                    skipped.append(lig)
-                    continue
-            if n_active >= max_active:
-                break
-            attempts = 1 if retry or e == NEW else state.get("attempts", 0) + 1
-            job_id = sched.submit_driver(batch_dir, lig)
-            write_state(
-                batch_dir, lig, state=QUEUED, job_id=job_id, attempts=attempts,
-                error=None, submitted=now(),
-            )  # fmt: skip
-            submitted.append(lig)
-            n_active += 1
-    waiting = (
-        sum(e in (NEW, INTERRUPTED) for e in eff.values())
-        - len(submitted)
-        - len(skipped)
+    if is_held(batch_dir):
+        # No new drivers while the batch is paused; 'release' starts them
+        if args.from_driver:
+            print(f"[{now()}] the batch is on hold - no ligands submitted")
+            return
+        sys.exit(f"The batch is on hold - continue it with '{PROGRAM} release'.")
+    submitted, n_active, waiting, skipped = submit_ligands(
+        batch_dir, cfg, sched, ligands, max_active, explicit or args.retry
     )
     if args.from_driver:
         print(f"[{now()}] submitted next ligands: {' '.join(submitted) or 'none'}")
@@ -486,9 +530,51 @@ def cmd_submit(args):
         )
 
 
-def kill_ligand_jobs(sched, lig, driver=True):
+def submit_ligands(batch_dir, cfg, sched, ligands, max_active, retry, resume=()):
+    """Submit the drivers of the ligands which are due, up to max_active active
+    ligands. Ligands in 'resume' are also restarted if they failed.
+    Returns (submitted ligands, number of active ligands, number of ligands
+    still waiting, ligands which were interrupted too often)."""
+    with BatchLock(batch_dir):
+        active_jobs = sched.active_jobs()
+        states = {lig: read_state(batch_dir, lig) for lig in list_ligands(batch_dir)}
+        eff = {lig: effective_state(s, active_jobs) for lig, s in states.items()}
+        n_active = sum(e in (QUEUED, RUNNING) for e in eff.values())
+        submitted, skipped = [], []
+        for lig in ligands:
+            state, e = states[lig], eff[lig]
+            if e in (DONE, QUEUED, RUNNING):
+                continue
+            again = retry or (lig in resume and e != CANCELLED)
+            if e in (FAILED, CANCELLED) and not again:
+                continue
+            if e == INTERRUPTED and not again:
+                # Do not resume a ligand whose driver keeps dying forever
+                if state.get("attempts", 0) >= cfg["max_attempts"]:
+                    skipped.append(lig)
+                    continue
+            if n_active >= max_active:
+                break
+            attempts = 1 if again or e == NEW else state.get("attempts", 0) + 1
+            job_id = sched.submit_driver(batch_dir, lig)
+            write_state(
+                batch_dir, lig, state=QUEUED, job_id=job_id, attempts=attempts,
+                error=None, submitted=now(),
+            )  # fmt: skip
+            submitted.append(lig)
+            n_active += 1
+    waiting = (
+        sum(e in (NEW, INTERRUPTED) for e in eff.values())
+        - len(submitted)
+        - len(skipped)
+    )
+    return submitted, n_active, waiting, skipped
+
+
+def kill_ligand_jobs(sched, batch_dir, lig, driver=True):
     """Cancel the simulation jobs (and optionally the driver) of a ligand."""
-    names = [sim_job_name(lig)] + ([driver_job_name(lig)] if driver else [])
+    names = [sim_job_name(batch_dir, lig)]
+    names += [driver_job_name(batch_dir, lig)] if driver else []
     job_ids = [j for j, (name, _) in sched.active_jobs().items() if name in names]
     # Never cancel the job we are running in
     own = (os.environ.get("PBS_JOBID") or os.environ.get("SLURM_JOB_ID") or "").split(
@@ -509,9 +595,90 @@ def cmd_cancel(args):
             state = read_state(batch_dir, lig)
             if state["state"] in (QUEUED, RUNNING):
                 write_state(batch_dir, lig, state=CANCELLED)
-            n = kill_ligand_jobs(sched, lig)
+            n = kill_ligand_jobs(sched, batch_dir, lig)
             if n or state["state"] in (QUEUED, RUNNING):
                 print(f"  {lig}: cancelled {n} job(s)")
+
+
+def cmd_hold(args):
+    """Pause the batch: nothing new is started until 'release'."""
+    batch_dir, cfg = args.dir, load_config(args.dir)
+    sched = Scheduler(cfg)
+    with BatchLock(batch_dir):
+        active_jobs = sched.active_jobs()
+        # Remember the ligands which are active now: 'release' restarts those
+        # whose driver did not survive the pause
+        active = [
+            lig
+            for lig in list_ligands(batch_dir)
+            if effective_state(read_state(batch_dir, lig), active_jobs)
+            in (QUEUED, RUNNING)
+        ]
+        previous = read_hold(batch_dir)
+        info = {
+            "since": previous.get("since") or now(),
+            "ligands": sorted(set(previous.get("ligands", [])) | set(active)),
+        }
+        with open(hold_path(batch_dir) + ".tmp", "w") as f:
+            json.dump(info, f, indent=1)
+        os.replace(hold_path(batch_dir) + ".tmp", hold_path(batch_dir))
+    # The drivers stop submitting once they see the marker. Hold twice, to
+    # catch the jobs which were being submitted at that moment.
+    held, killed = set(), set()
+    for round_no in range(2):
+        if round_no:
+            time.sleep(args.settle)
+            active_jobs = sched.active_jobs()
+        sims, drivers, running = batch_jobs(batch_dir, active_jobs)
+        sched.hold(sims + drivers)
+        held.update(sims + drivers)
+        if args.kill_running:
+            sched.cancel(running)
+            killed.update(running)
+    print(f"The batch is on hold: {len(held)} waiting job(s) held.")
+    if args.kill_running:
+        print(
+            f"{len(killed)} running simulation job(s) deleted; they are repeated "
+            "from their start after the release."
+        )
+    elif running:
+        print(
+            f"{len(running)} simulation job(s) are still running and will finish "
+            "(delete them with 'hold --kill-running' to free their nodes now)."
+        )
+    print(f"Continue with '{PROGRAM} release'.")
+
+
+def cmd_release(args):
+    """Continue a paused batch, restarting ligands whose driver died meanwhile."""
+    batch_dir, cfg = args.dir, load_config(args.dir)
+    sched = Scheduler(cfg)
+    if not is_held(batch_dir):
+        sys.exit("The batch is not on hold.")
+    info = read_hold(batch_dir)
+    os.remove(hold_path(batch_dir))
+    sims, drivers, _ = batch_jobs(batch_dir, sched.active_jobs())
+    sched.release(sims + drivers)
+    print(f"Released {len(sims) + len(drivers)} job(s).")
+    # Ligands which were active when the batch was paused but have no driver
+    # any more (walltime, node or server failure) are resumed. Their left-over
+    # simulation jobs are replaced by the new driver.
+    max_active = args.max_active or cfg["max_active_ligands"]
+    submitted, _, waiting, skipped = submit_ligands(
+        batch_dir, cfg, sched, list_ligands(batch_dir), max_active, False,
+        resume=info.get("ligands", []),
+    )  # fmt: skip
+    if submitted:
+        print(f"Restarted {len(submitted)} ligand(s): {' '.join(submitted)}")
+    if waiting > 0:
+        print(
+            f"{waiting} more will be started automatically as running ligands finish."
+        )
+    if skipped:
+        print(
+            f"{len(skipped)} interrupted ligand(s) were not resumed because they already "
+            f"stopped {cfg['max_attempts']} times - resume with 'submit --retry'."
+        )
 
 
 def cmd_reset(args):
@@ -525,7 +692,7 @@ def cmd_reset(args):
             "bound_param.prm7", "bound_param.rst7", "free_param.prm7", "free_param.rst7",
         )  # fmt: skip
     for lig in select_ligands(batch_dir, args.ligands):
-        kill_ligand_jobs(sched, lig)
+        kill_ligand_jobs(sched, batch_dir, lig)
         lig_dir = os.path.join(batch_dir, lig)
         for entry in os.listdir(lig_dir):
             path = os.path.join(lig_dir, entry)
@@ -607,7 +774,7 @@ def cmd_status(args):
         stage = state.get("stage", "-") if eff not in (NEW, DONE) else "-"
         done, total = state.get("sims_done"), state.get("sims_total")
         sims = f"{done}/{total}" if total else "-"
-        jobs = sim_jobs.get(sim_job_name(lig), {"R": 0, "Q": 0})
+        jobs = sim_jobs.get(sim_job_name(batch_dir, lig), {"R": 0, "Q": 0})
         result = read_result(batch_dir, lig)
         dg = f"{result[0]} +/- {result[1]}" if result else "-"
         note = (state.get("error") or "").splitlines()[0][:60] if eff == FAILED else ""
@@ -644,6 +811,11 @@ def cmd_status(args):
     summary = ", ".join(f"{count} {name}" for name, count in sorted(totals.items()))
     running = sum(s == "R" for _, s in active_jobs.values())
     print(f"\n  {n} ligands: {summary}")
+    if is_held(batch_dir):
+        print(
+            f"  ON HOLD since {read_hold(batch_dir).get('since', '?')} - continue "
+            f"with '{PROGRAM} release'"
+        )
     print(
         f"  your jobs in the queue: {running} running, {len(active_jobs) - running} waiting\n"
     )
@@ -690,7 +862,8 @@ def status_detail(batch_dir, lig, active_jobs):
         leg, stage = stage_dir.split(os.sep)[-3:-1]
         print(f"    {leg + '/' + stage:18s} {len(finished):4d} / {len(runs)}")
 
-    jobs = [(j, s) for j, (name, s) in active_jobs.items() if name == sim_job_name(lig)]
+    name = sim_job_name(batch_dir, lig)
+    jobs = [(j, s) for j, (n, s) in active_jobs.items() if n == name]
     print(
         f"\n  Simulation jobs in the queue: {sum(s == 'R' for _, s in jobs)} running, "
         f"{sum(s == 'Q' for _, s in jobs)} waiting"
@@ -916,7 +1089,7 @@ def drop_slurm_time_limit():
     a3.SlurmConfig.get_submission_cmds = get_submission_cmds
 
 
-def make_scheduler_config(cfg, lig):
+def make_scheduler_config(cfg, batch_dir, lig):
     """The a3fe scheduler configuration used for all jobs of a ligand."""
     import a3fe as a3
 
@@ -927,7 +1100,7 @@ def make_scheduler_config(cfg, lig):
             raise RuntimeError(
                 "This a3fe installation has no PBS support (a3fe.PbsConfig)"
             )
-        extra["N"] = sim_job_name(lig)
+        extra["N"] = sim_job_name(batch_dir, lig)
         config = a3.PbsConfig(
             walltime=res["walltime"],
             ncpus=res["ncpus"],
@@ -940,7 +1113,7 @@ def make_scheduler_config(cfg, lig):
         config.setup_commands = list(cfg["setup_commands"]) + config.setup_commands
         return config
 
-    extra["job-name"] = sim_job_name(lig)
+    extra["job-name"] = sim_job_name(batch_dir, lig)
     extra.setdefault("cpus-per-task", str(res["ncpus"]))
     if res["mem"]:
         extra.setdefault("mem", res["mem"])
@@ -1034,9 +1207,16 @@ def setup_calculation(calc, sysprep, lig_dir):
     calc._dump()
 
 
-def run_production(calc, cfg, progress):
+def run_production(calc, cfg, progress, batch_dir=None):
     """Run all production simulations which have not completed yet, and
-    wait for them. Simulations which fail are repeated a few times."""
+    wait for them. Simulations which fail are repeated a few times.
+
+    While the batch is on hold nothing is submitted, and simulations which
+    were deleted during the hold are repeated without counting as failures."""
+
+    def held():
+        return batch_dir is not None and is_held(batch_dir)
+
     protocol = cfg["protocol"]
     runtime = float(protocol["runtime"])
     sims = all_sims(calc)
@@ -1055,7 +1235,10 @@ def run_production(calc, cfg, progress):
             return False
 
     interval = calc.slurm_config.queue_check_interval
-    for attempt in range(protocol["max_sim_retries"] + 1):
+    attempt = 0
+    while attempt <= protocol["max_sim_retries"]:
+        if batch_dir is not None:
+            wait_while_held(batch_dir)
         todo = [sim for sim in sims if not complete(sim)]
         progress(len(sims) - len(todo), len(sims))
         if not todo:
@@ -1065,20 +1248,31 @@ def run_production(calc, cfg, progress):
             f"{len(sims)} simulations for {runtime} ns",
             flush=True,
         )
+        was_held = False
+        waiting = []
         for sim in todo:
+            if held():
+                # The remaining simulations are submitted after the release
+                was_held = True
+                break
             # Remove any partial output, so that the simulation starts afresh
             sim.clean()
             sim.run(runtime)
+            waiting.append(sim)
             # Do not flood the scheduler with submissions
             time.sleep(float(cfg["submit_delay"]))
-        waiting = list(todo)
+        n_finished = len(sims) - len(todo) + len(waiting)
         while waiting:
             time.sleep(interval)
+            was_held = was_held or held()
             for queue in queues:
                 queue.update()
             # Checking sim.running also resubmits simulations which crashed with NaNs
             waiting = [sim for sim in waiting if sim.running]
-            progress(len(sims) - len(waiting), len(sims))
+            progress(n_finished - len(waiting), len(sims))
+        # Simulations lost in a round with a hold were probably deleted on purpose
+        if not was_held:
+            attempt += 1
 
     failed = [sim.output_dir for sim in sims if not complete(sim)]
     if failed:
@@ -1118,8 +1312,9 @@ def cmd_run(args):
     try:
         ncpus = limit_cpu_count()
         print(f"Using {ncpus} core(s) for the driver", flush=True)
+        wait_while_held(batch_dir)
         # Remove simulation jobs left behind by an interrupted driver
-        n = kill_ligand_jobs(sched, lig, driver=False)
+        n = kill_ligand_jobs(sched, batch_dir, lig, driver=False)
         if n:
             print(f"Cancelled {n} job(s) left over from a previous run", flush=True)
             time.sleep(10)
@@ -1135,7 +1330,7 @@ def cmd_run(args):
         update(stage="setup")
         protocol = cfg["protocol"]
         engine_type = a3.EngineType[cfg["engine"].upper()]
-        sched_config = make_scheduler_config(cfg, lig)
+        sched_config = make_scheduler_config(cfg, batch_dir, lig)
         engine_config = None
         if protocol["engine_options"]:
             engine_class = (
@@ -1169,22 +1364,27 @@ def cmd_run(args):
         apply_scheduler_config()
         tolerate_lost_jobs()
         sysprep = make_sysprep_config(cfg, engine_type)
-        for attempt in range(protocol["max_sim_retries"] + 1):
+        attempt = 0
+        while True:
             try:
                 setup_calculation(calc, sysprep, lig_dir)
                 break
             except Interrupted:
                 raise
             except Exception as e:
-                if attempt == protocol["max_sim_retries"]:
+                # A set-up step whose jobs were deleted during a hold is
+                # repeated after the release, without counting as a failure
+                if not wait_while_held(batch_dir):
+                    attempt += 1
+                if attempt > protocol["max_sim_retries"]:
                     raise
                 traceback.print_exc()
                 print(
                     f"[{now()}] The setup failed ({type(e).__name__}) - repeating the "
-                    f"unfinished part (attempt {attempt + 2})",
+                    f"unfinished part (attempt {attempt + 1})",
                     flush=True,
                 )
-                kill_ligand_jobs(sched, lig, driver=False)
+                kill_ligand_jobs(sched, batch_dir, lig, driver=False)
                 time.sleep(30)
         apply_scheduler_config()
         # Forget the jobs of previous, interrupted runs
@@ -1193,7 +1393,10 @@ def cmd_run(args):
 
         update(stage="production")
         run_production(
-            calc, cfg, lambda done, total: update(sims_done=done, sims_total=total)
+            calc,
+            cfg,
+            lambda done, total: update(sims_done=done, sims_total=total),
+            batch_dir,
         )
 
         update(stage="analysis")
@@ -1216,13 +1419,13 @@ def cmd_run(args):
         if read_state(batch_dir, lig).get("state") != CANCELLED:
             update(state=INTERRUPTED, error=f"Interrupted: {e}")
         print(f"[{now()}] ===== {lig}: interrupted ({e}) =====", flush=True)
-        kill_ligand_jobs(sched, lig, driver=False)
+        kill_ligand_jobs(sched, batch_dir, lig, driver=False)
         sys.exit(1)
     except BaseException as e:
         traceback.print_exc()
         update(state=FAILED, error=f"{type(e).__name__}: {e}")
         print(f"[{now()}] ===== {lig}: FAILED =====", flush=True)
-        kill_ligand_jobs(sched, lig, driver=False)
+        kill_ligand_jobs(sched, batch_dir, lig, driver=False)
         sys.exit(1)
 
 
@@ -1274,6 +1477,18 @@ def main(argv=None):
     p.add_argument("ligands", nargs="*")
     p.add_argument("--all", action="store_true")
     p.set_defaults(func=cmd_cancel)
+
+    p = sub.add_parser(
+        "hold", help="pause the batch: hold its waiting jobs, start nothing new"
+    )
+    p.add_argument("--kill-running", action="store_true",
+                   help="also delete the running simulation jobs (repeated after the release)")  # fmt: skip
+    p.add_argument("--settle", type=float, default=15, help=argparse.SUPPRESS)
+    p.set_defaults(func=cmd_hold)
+
+    p = sub.add_parser("release", help="continue a batch paused with 'hold'")
+    p.add_argument("--max-active", type=int, help="override max_active_ligands")
+    p.set_defaults(func=cmd_release)
 
     p = sub.add_parser(
         "reset", help="delete all output of the named ligands (keeps the input)"

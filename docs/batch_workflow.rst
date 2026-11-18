@@ -126,6 +126,9 @@ Commands
     a3fe-abfe status --state failed   only ligands in the given state(s)
     a3fe-abfe status lig_A            details: stages, jobs, error, end of the driver log
     a3fe-abfe cancel lig_A            stop a ligand and delete its jobs  (--all: every ligand)
+    a3fe-abfe hold                    pause the batch: hold its waiting jobs and start nothing new
+    a3fe-abfe hold --kill-running     ... and delete its running simulation jobs, to free the nodes now
+    a3fe-abfe release                 continue a paused batch
     a3fe-abfe reset lig_A             delete all output of a ligand, keeping its input
     a3fe-abfe collect                 write abfe_results.tsv (id, dG, CI95, dG of each run)
 
@@ -191,6 +194,22 @@ Resuming
 
 Simulation jobs left over from an interrupted driver are deleted when the ligand is resumed.
 
+Pausing a batch
+~~~~~~~~~~~~~~~
+
+``a3fe-abfe hold`` frees the cluster for other work without losing anything which has finished:
+
+- the waiting simulation and driver jobs of the batch are held in the queue (``qhold`` / ``scontrol hold``);
+- running simulation jobs finish normally, unless ``--kill-running`` is given: then they are deleted and their windows
+  are run again from the start after the release (finished windows are always kept);
+- the drivers keep running, but submit nothing while the batch is on hold, and ``submit`` starts no ligands. Jobs which
+  were deleted during the hold do not count as failed simulations.
+
+``a3fe-abfe release`` releases the held jobs. A driver can stop during a long hold (walltime, node or scheduler
+failure): ligands which were active when the batch was paused and have no driver any more are restarted by
+``release``, also if they are ``failed``, and continue from their finished windows. ``status`` shows when a batch is on
+hold. Only the jobs of this batch are touched.
+
 What is handled automatically
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -216,7 +235,9 @@ Files
         bound/, free/               legs: ensemble_equilibration_N/ and <stage>/output/lambda_X/run_NN/
         output/overall_stats.dat    final dG, written last
 
-The jobs of a ligand are named ``drv.lig_<NAME>`` (driver) and ``sim.lig_<NAME>`` (simulations) in the queue. With the
+The jobs of a ligand are named ``drv.lig_<NAME>.<TAG>`` (driver) and ``sim.lig_<NAME>.<TAG>`` (simulations) in the
+queue. ``<TAG>`` identifies the batch directory (it is derived from its path), so ligands with the same name can run in
+several batches at the same time. Do not rename or move a batch directory while its jobs are in the queue. With the
 default GROMACS protocol a ligand needs 12 set-up jobs and 48 lambda windows x ``ensemble_size`` production jobs (240
 for 5 replicates).
 

@@ -208,13 +208,13 @@ def test_active_jobs_slurm():
         (
             "pbs",
             "21.pbs-server\n",
-            ["#PBS -N drv.lig_B_2", "#PBS -l select=1:ncpus=2:mem=16gb", "#PBS -A acc"],
+            ["#PBS -l select=1:ncpus=2:mem=16gb", "#PBS -A acc"],
             "walltime",
         ),
         (
             "slurm",
             "21;cluster\n",
-            ["#SBATCH --job-name=drv.lig_B_2", "#SBATCH --mem=16gb", "#SBATCH --A=acc"],
+            ["#SBATCH --mem=16gb", "#SBATCH --A=acc"],
             "--time",
         ),
     ],
@@ -238,6 +238,8 @@ def test_submit_driver(batch, scheduler, output, expected, absent):
     for line in expected + ["module load gromacs"]:
         assert line in script.splitlines()
     assert absent not in script
+    name = abfe.driver_job_name(batch, "lig_B_2")
+    assert f"-N {name}\n" in script or f"--job-name={name}\n" in script
     # The driver runs this module for the ligand, and then starts the next ones
     assert f"-m a3fe.cli.abfe -d {batch} run lig_B_2\n" in script
     assert f"-m a3fe.cli.abfe -d {batch} submit --from-driver\n" in script
@@ -338,11 +340,14 @@ def test_make_scheduler_config_pbs():
             },
         },
     )
-    config = abfe.make_scheduler_config(cfg, "lig_A")
+    config = abfe.make_scheduler_config(cfg, "/batch", "lig_A")
     assert isinstance(config, PbsConfig)
     assert (config.queue, config.walltime) == ("long", None)
     assert config.get_select() == "1:ncpus=8:mem=8gb"
-    assert config.extra_options == {"A": "acc", "N": "sim.lig_A"}
+    assert config.extra_options == {
+        "A": "acc",
+        "N": abfe.sim_job_name("/batch", "lig_A"),
+    }
     assert config.setup_commands[0] == "module load gromacs"
 
 
@@ -355,11 +360,11 @@ def test_make_scheduler_config_slurm(monkeypatch):
         abfe.DEFAULTS,
         {"scheduler": "slurm", "simulation": {"queue": "cpu", "walltime": "01:00:00"}},
     )
-    config = abfe.make_scheduler_config(cfg, "lig_A")
+    config = abfe.make_scheduler_config(cfg, "/batch", "lig_A")
     assert isinstance(config, SlurmConfig)
     assert (config.partition, config.time, config.gres) == ("cpu", "01:00:00", "none")
     assert config.extra_options == {
-        "job-name": "sim.lig_A",
+        "job-name": abfe.sim_job_name("/batch", "lig_A"),
         "cpus-per-task": "8",
         "mem": "8gb",
     }
@@ -387,7 +392,12 @@ def test_status_and_collect(batch, capsys):
         finished="2026-01-01 12:05:30",
     )
     set_state(batch, "lig_lig_A", state=abfe.RUNNING, job_id="11", stage="production")
-    jobs = {"11": ("drv.lig_lig_A", "R"), "12": ("sim.lig_lig_A", "Q")}
+    jobs = {
+        "11": (abfe.driver_job_name(batch, "lig_lig_A"), "R"),
+        "12": (abfe.sim_job_name(batch, "lig_lig_A"), "Q"),
+        # A ligand of the same name in another batch
+        "13": (abfe.sim_job_name(batch + "_other", "lig_lig_A"), "R"),
+    }
     with patch.object(abfe.Scheduler, "active_jobs", return_value=jobs):
         abfe.main(["-d", batch, "status"])
     lines = capsys.readouterr().out.splitlines()
@@ -438,3 +448,194 @@ def test_elapsed():
     assert abfe.elapsed(stopped, abfe.QUEUED) == "20m"
     done = dict(stopped, finished="2026-01-03 10:00:00")
     assert abfe.elapsed(done, abfe.DONE) == "2d"
+
+
+def test_job_names_differ_between_batches(batch):
+    """Test that ligands of the same name in two batches have different jobs."""
+    other = batch + "_other"
+    assert abfe.sim_job_name(batch, "lig_A") != abfe.sim_job_name(other, "lig_A")
+    assert abfe.driver_job_name(batch, "lig_A") != abfe.driver_job_name(other, "lig_A")
+    assert abfe.sim_job_name(batch, "lig_A").startswith("sim.lig_A.")
+    # The name does not depend on how the directory is given
+    assert abfe.sim_job_name(batch + "/", "lig_A") == abfe.sim_job_name(batch, "lig_A")
+
+    jobs = {
+        "1": (abfe.sim_job_name(batch, "lig_B_2"), "Q"),
+        "2": (abfe.driver_job_name(batch, "lig_B_2"), "R"),
+        "3": (abfe.sim_job_name(other, "lig_B_2"), "Q"),
+        "4": (abfe.driver_job_name(other, "lig_B_2"), "R"),
+    }
+    sched = abfe.Scheduler({"scheduler": "pbs"})
+    with (
+        patch.object(abfe.Scheduler, "active_jobs", return_value=jobs),
+        patch.object(abfe.Scheduler, "cancel") as cancel,
+    ):
+        assert abfe.kill_ligand_jobs(sched, batch, "lig_B_2") == 2
+    assert sorted(cancel.call_args[0][0]) == ["1", "2"]
+
+
+def hold_release(batch_dir, command, *args, active_jobs=None):
+    """Run 'hold' or 'release' with a mocked scheduler. Returns the ids of the
+    held, released and cancelled jobs, and the ligands whose driver was submitted."""
+    calls = {"hold": [], "release": [], "cancel": [], "submitted": []}
+
+    def submit_driver(self, batch_dir, lig):
+        calls["submitted"].append(lig)
+        return str(200 + len(calls["submitted"]))
+
+    with (
+        patch.object(abfe.Scheduler, "active_jobs", return_value=active_jobs or {}),
+        patch.object(abfe.Scheduler, "submit_driver", submit_driver),
+        patch.object(abfe.Scheduler, "hold", lambda self, ids: calls["hold"].extend(ids)),
+        patch.object(abfe.Scheduler, "release", lambda self, ids: calls["release"].extend(ids)),
+        patch.object(abfe.Scheduler, "cancel", lambda self, ids: calls["cancel"].extend(ids)),
+    ):  # fmt: skip
+        extra = ["--settle", "0"] if command == "hold" else []
+        abfe.main(["-d", batch_dir, command, *extra, *args])
+    return calls
+
+
+def test_hold_and_release(batch, capsys):
+    """Test that 'hold' pauses the batch and 'release' continues it."""
+    set_state(batch, "lig_B_2", state=abfe.RUNNING, job_id="1")
+    set_state(batch, "lig_lig_A", state=abfe.QUEUED, job_id="2")
+    jobs = {
+        "1": (abfe.driver_job_name(batch, "lig_B_2"), "R"),
+        "2": (abfe.driver_job_name(batch, "lig_lig_A"), "Q"),
+        "3": (abfe.sim_job_name(batch, "lig_B_2"), "Q"),
+        "4": (abfe.sim_job_name(batch, "lig_B_2"), "R"),
+        "5": (abfe.sim_job_name(batch + "_other", "lig_B_2"), "Q"),
+    }
+    calls = hold_release(batch, "hold", active_jobs=jobs)
+    assert abfe.is_held(batch)
+    # Waiting jobs of this batch are held; running jobs are left alone
+    assert sorted(set(calls["hold"])) == ["2", "3"]
+    assert calls["cancel"] == []
+    assert abfe.read_hold(batch)["ligands"] == ["lig_B_2", "lig_lig_A"]
+
+    calls = hold_release(batch, "hold", "--kill-running", active_jobs=jobs)
+    assert sorted(set(calls["cancel"])) == ["4"]
+
+    # Nothing is submitted while the batch is on hold
+    with pytest.raises(SystemExit):
+        submit(batch, "--retry", active_jobs=jobs)
+    assert submit(batch, "--from-driver", active_jobs=jobs) == []
+    with patch.object(abfe.Scheduler, "active_jobs", return_value=jobs):
+        abfe.main(["-d", batch, "status"])
+    assert "ON HOLD" in capsys.readouterr().out
+
+    calls = hold_release(batch, "release", active_jobs=jobs)
+    assert not abfe.is_held(batch)
+    assert sorted(calls["release"]) == ["2", "3"]
+    assert calls["submitted"] == []
+    with pytest.raises(SystemExit):
+        hold_release(batch, "release", active_jobs=jobs)
+
+
+def test_release_restarts_dead_drivers(batch):
+    """Test that ligands whose driver died during the hold are resumed."""
+    set_state(batch, "lig_B_2", state=abfe.RUNNING, job_id="1", attempts=3)
+    set_state(batch, "lig_lig_A", state=abfe.RUNNING, job_id="2")
+    jobs = {
+        "1": (abfe.driver_job_name(batch, "lig_B_2"), "R"),
+        "2": (abfe.driver_job_name(batch, "lig_lig_A"), "R"),
+        "3": (abfe.sim_job_name(batch, "lig_B_2"), "Q"),
+    }
+    hold_release(batch, "hold", active_jobs=jobs)
+    # One driver failed (e.g. the server could not be reached), the other one
+    # disappeared, although it was already resumed max_attempts times
+    set_state(batch, "lig_lig_A", state=abfe.FAILED, error="ValueError")
+    calls = hold_release(batch, "release", active_jobs={"3": jobs["3"]})
+    assert calls["release"] == ["3"]
+    assert calls["submitted"] == ["lig_B_2", "lig_lig_A"]
+    assert abfe.read_state(batch, "lig_lig_A")["state"] == abfe.QUEUED
+
+    # A ligand which was cancelled during the hold stays cancelled
+    hold_release(batch, "hold", active_jobs={"201": jobs["1"], "202": jobs["2"]})
+    set_state(batch, "lig_B_2", state=abfe.CANCELLED)
+    calls = hold_release(batch, "release", active_jobs={"202": jobs["2"]})
+    assert calls["submitted"] == []
+
+
+class FakeSim:
+    """A simulation which completes when its job leaves the queue, unless the
+    job was deleted."""
+
+    def __init__(self, log):
+        self.log, self.done, self.job_alive, self.deleted = log, False, False, False
+        self.engine_backend = self
+        self.output_dir, self.slurm_output_files = "out", []
+
+    def run_completed(self, output_dir, files):
+        return self.done
+
+    def get_tot_simtime(self):
+        return 1.0
+
+    def clean(self):
+        pass
+
+    def run(self, runtime):
+        self.log.append("run")
+        self.job_alive = True
+
+    @property
+    def running(self):
+        if self.job_alive:
+            self.job_alive = False
+            self.done = not self.deleted
+            self.deleted = False
+        return False
+
+
+def fake_calc(sims):
+    from types import SimpleNamespace as NS
+
+    stage = NS(lam_windows=[NS(sims=sims)], virtual_queue=NS(update=lambda: None))
+    return NS(legs=[NS(stages=[stage])], slurm_config=NS(queue_check_interval=0))
+
+
+def test_run_production_hold(batch, monkeypatch):
+    """Test that jobs deleted during a hold are repeated without using up the
+    attempts, and that nothing is submitted while the batch is on hold."""
+    cfg = abfe.merge(
+        abfe.DEFAULTS,
+        {"submit_delay": 0, "protocol": {"runtime": 1.0, "max_sim_retries": 0}},
+    )
+    log = []
+    sims = [FakeSim(log), FakeSim(log)]
+
+    # Without a hold a lost simulation fails the ligand once the attempts are used
+    sims[0].deleted = True
+    with pytest.raises(RuntimeError, match="1 simulation"):
+        abfe.run_production(fake_calc(sims), cfg, lambda done, total: None, batch)
+    assert log == ["run", "run"]
+
+    # The batch is put on hold after the first submission, and the job is deleted
+    log.clear()
+    sims = [FakeSim(log), FakeSim(log)]
+    sims[0].deleted = True
+    original_run = FakeSim.run
+
+    def run_then_hold(self, runtime):
+        original_run(self, runtime)
+        if log == ["run"]:
+            open(abfe.hold_path(batch), "w").close()
+
+    def release(batch_dir):
+        log.append("waited")
+        os.remove(abfe.hold_path(batch_dir))
+        return True
+
+    monkeypatch.setattr(sims[0], "run", lambda runtime: run_then_hold(sims[0], runtime))
+    monkeypatch.setattr(
+        abfe, "wait_while_held", lambda d: abfe.is_held(d) and release(d)
+    )
+    progress = []
+    abfe.run_production(
+        fake_calc(sims), cfg, lambda done, total: progress.append(done), batch
+    )
+    # The second simulation was only submitted after the release
+    assert log == ["run", "waited", "run", "run"]
+    assert all(sim.done for sim in sims)
+    assert progress[-1] == 2 and max(progress) == 2
